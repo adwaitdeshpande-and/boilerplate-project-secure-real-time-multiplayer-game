@@ -1,26 +1,37 @@
 require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const expect = require('chai');
-const helmet = require('helmet');
+
+const http = require('http');
 const cors = require('cors');
-const socket = require('socket.io');
+const express = require('express');
+const helmet = require('helmet');
+const nocache = require('nocache');
+const { Server } = require('socket.io');
+const expect = require('chai');
+const path = require('path');
 
 const fccTestingRoutes = require('./routes/fcctesting.js');
 const runner = require('./test-runner.js');
 
+const { EVENTS, GAMES_STATUS } = require('./public/constants.mjs');
+const { default: Collectible, COLLECTIBLE_SIZE } = require('./public/objects/Collectible.mjs');
+const { default: Player, PLAYER_SIZE } = require('./public/objects/Player.mjs');
+const { getRandomPosition } = require('./public/utils.mjs');
+
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
 
-app.use(helmet());
-app.use(helmet.noCache());
+//For FCC testing purposes and enables user to connect from outside the hosting platform
+app.use(cors({ origin: '*' }));
+app.use('/public', express.static(path.join(__dirname, 'public')));
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+app.use(nocache());
+app.use(helmet.noSniff());
+app.use(helmet.xssFilter());
 app.use(helmet.hidePoweredBy({ setTo: 'PHP 7.4.3' }));
-app.use(cors({origin: '*'})); //For FCC testing purposes only
-
-app.use('/public', express.static(process.cwd() + '/public'));
-app.use('/assets', express.static(process.cwd() + '/assets'));
-
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
 
 // Index page (static HTML)
 app.route('/')
@@ -38,12 +49,12 @@ app.use(function(req, res, next) {
     .send('Not Found');
 });
 
-const portNum = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// Set up server and tests
-const server = app.listen(portNum, () => {
-  console.log(`Listening on port ${portNum}`);
-  if (process.env.NODE_ENV==='test') {
+server.listen(port, () => {
+  console.log(`Listening on port ${port}`);
+
+  if (process.env.NODE_ENV === 'test') {
     console.log('Running Tests...');
     setTimeout(function () {
       try {
@@ -56,96 +67,80 @@ const server = app.listen(portNum, () => {
   }
 });
 
-// Socket.io setup:
-// Start app and bind 
-// Socket.io to the same port
-const io = socket(server);
-const Collectible = require('./public/Collectible');
-const { generateStartPos, canvasCalcs } = require('./public/canvas-data');
+let state = {
+  collectible: createNewCollectible(),
+  players: [],
+  status: GAMES_STATUS.INACTIVE
+};
 
-let currPlayers = [];
-const destroyedCoins = [];
+io.on('connection', socket => {
+  socket.on(EVENTS.NEW_PLAYER, () => {
+    const { id } = socket;
+    const { players } = state;
 
-const generateCoin = () => {
-  const rand = Math.random();
-  let coinValue;
+    state = {
+      ...state,
+      players: [...players, createNewPlayer(id)],
+      status: GAMES_STATUS.ACTIVE
+    };
 
-  if (rand < 0.6) {
-    coinValue = 1;
-  } else if (rand < 0.85) {
-    coinValue = 2;
-  } else {
-    coinValue = 3;
-  }
-
-  return new Collectible({ 
-    x: generateStartPos(canvasCalcs.playFieldMinX, canvasCalcs.playFieldMaxX, 5),
-    y: generateStartPos(canvasCalcs.playFieldMinY, canvasCalcs.playFieldMaxY, 5),
-    value: coinValue,
-    id: Date.now()
-  });
-}
-
-let coin = generateCoin();
-
-io.sockets.on('connection', socket => {
-  console.log(`New connection ${socket.id}`);
-
-  socket.emit('init', { id: socket.id, players: currPlayers, coin });
-
-  socket.on('new-player', obj => {
-    obj.id = socket.id;
-    currPlayers.push(obj);
-    socket.broadcast.emit('new-player', obj);
+    io.emit(EVENTS.GAME_STATE_CHANGE, state);
   });
 
-  socket.on('move-player', (dir, obj) => {
-    const movingPlayer = currPlayers.find(player => player.id === socket.id);
-    if (movingPlayer) {
-      movingPlayer.x = obj.x;
-      movingPlayer.y = obj.y;
+  socket.on(EVENTS.PLAYER_MOVE, movingPlayer => {
+    const { players } = state;
 
-      socket.broadcast.emit('move-player', { id: socket.id, dir, posObj: { x: movingPlayer.x, y: movingPlayer.y } });
+    state = {
+      ...state,
+      players: players.map(
+        player => player.id === movingPlayer.id
+          ? ({ ...movingPlayer })
+          : player
+      )
+    };
+
+    io.emit(EVENTS.GAME_STATE_CHANGE, state);
+  });
+
+  socket.on(EVENTS.PLAYER_COLLECT, ({ player: scoringPlayer, collectible }) => {
+    const { players, collectible: stateCollectible } = state;
+    const isActiveCollectible = stateCollectible.id === collectible.id;
+
+    if (!isActiveCollectible) {
+      return;
     }
-  });
 
-  socket.on('stop-player', (dir, obj) => {
-    const stoppingPlayer = currPlayers.find(player => player.id === socket.id);
-    if (stoppingPlayer) {
-      stoppingPlayer.x = obj.x;
-      stoppingPlayer.y = obj.y;
+    state = {
+      ...state,
+      collectible: createNewCollectible(),
+      players: players.map(player =>
+        player.id === scoringPlayer.id
+          ? ({ ...scoringPlayer, score: scoringPlayer.score + collectible.value })
+          : player
+      )
+    };
 
-      socket.broadcast.emit('stop-player', { id: socket.id, dir, posObj: { x: stoppingPlayer.x, y: stoppingPlayer.y } });
-    }
-  });
-  
-  socket.on('destroy-item', ({ playerId, coinValue, coinId }) => {
-    if (!destroyedCoins.includes(coinId)) {
-      const scoringPlayer = currPlayers.find(obj => obj.id === playerId);
-      const sock = io.sockets.connected[scoringPlayer.id];
-
-      scoringPlayer.score += coinValue;
-      destroyedCoins.push(coinId);
-
-      // Broadcast to all players when someone scores
-      io.emit('update-player', scoringPlayer);
-
-      // Communicate win state and broadcast losses
-      if (scoringPlayer.score >= 100) {
-        sock.emit('end-game', 'win');
-        sock.broadcast.emit('end-game', 'lose');
-      } 
-
-      // Generate new coin and send it to all players
-      coin = generateCoin();
-      io.emit('new-coin', coin);
-    }
+    io.emit(EVENTS.GAME_STATE_CHANGE, state);
   });
 
   socket.on('disconnect', () => {
-    socket.broadcast.emit('remove-player', socket.id);
-    currPlayers = currPlayers.filter(player => player.id !== socket.id);
+    const { players } = state;
+
+    state = {
+      ...state,
+      players: players.filter(player => player.id !== socket.id)
+    };
+
+    io.emit(EVENTS.GAME_STATE_CHANGE, state);
   });
 });
+
+function createNewCollectible(id = Date.now()) {
+  return new Collectible({ id, ...getRandomPosition(COLLECTIBLE_SIZE) });
+}
+
+function createNewPlayer(id) {
+  return new Player({ id, ...getRandomPosition(PLAYER_SIZE) });
+}
 
 module.exports = app; // For testing

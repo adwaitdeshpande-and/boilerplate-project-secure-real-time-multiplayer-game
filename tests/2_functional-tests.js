@@ -1,12 +1,3 @@
-/*
-*       
-*       To run the tests on Glitch, set `NODE_ENV` to `test` 
-*       without quotes in the `.env` file. 
-*       To run the tests in the console, open the terminal 
-*       with [Ctrl + `] (backtick) and run the command `npm run test`.
-*
-*/
-
 const chai = require('chai');
 const assert = chai.assert;
 const chaiHttp = require('chai-http');
@@ -15,7 +6,6 @@ const server = require('../server');
 chai.use(chaiHttp);
 
 suite('Functional Tests', () => {
-
   suite('Headers test', () => {
     test("Prevent the client from trying to guess / sniff the MIME type.", done => {
       chai.request(server)
@@ -56,5 +46,4 @@ suite('Functional Tests', () => {
         });
     });
   });
-
 });
